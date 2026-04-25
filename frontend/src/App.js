@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 import Upload from "./components/Upload";
 import Chat from "./components/Chat";
 
@@ -10,6 +10,26 @@ export default function App() {
   const [messages, setMessages] = useState([]);
   const [loading, setLoading] = useState(false);
   const [uploaded, setUploaded] = useState(false);
+  const [contextLost, setContextLost] = useState(false);
+
+  const checkServerContext = useCallback(async () => {
+    if (!uploaded) return;
+    try {
+      const res = await fetch(`${API_BASE}/chunks/stats`);
+      if (res.ok) {
+        const { total_chunks } = await res.json();
+        if (total_chunks === 0) {
+          setUploaded(false);
+          setContextLost(true);
+        }
+      }
+    } catch (_) {}
+  }, [uploaded]);
+
+  useEffect(() => {
+    window.addEventListener("focus", checkServerContext);
+    return () => window.removeEventListener("focus", checkServerContext);
+  }, [checkServerContext]);
 
   const handleSend = async (query) => {
     if (!query.trim() || loading) return;
@@ -65,6 +85,12 @@ export default function App() {
   return (
     <div className="app">
       <header className="app-header">RAG Assistant</header>
+      {contextLost && (
+        <div className="context-lost-banner">
+          The server was restarted and your documents are no longer loaded.
+          Please re-upload your file to continue.
+        </div>
+      )}
       <div className="app-body">
         <aside className="sidebar">
           <div>
@@ -91,7 +117,11 @@ export default function App() {
             </select>
           </div>
 
-          <Upload apiBase={API_BASE} apiKey={apiKey} onUploadSuccess={() => setUploaded(true)} />
+          <Upload
+            apiBase={API_BASE}
+            apiKey={apiKey}
+            onUploadSuccess={() => { setUploaded(true); setContextLost(false); }}
+          />
         </aside>
 
         <Chat

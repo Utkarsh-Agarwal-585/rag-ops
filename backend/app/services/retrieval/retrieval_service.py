@@ -42,13 +42,25 @@ def _normalize_scores(results: list[tuple[str, float]]) -> dict[str, float]:
     return {cid: (s - lo) / span for cid, s in results}
 
 
-def retrieve(query: str, top_n: int | None = None) -> list[dict]:
+def retrieve(query: str, top_n: int | None = None) -> tuple[list[dict], float, float]:
     """
-    Run hybrid retrieval for *query* and return the top-N ranked results.
+    Run hybrid retrieval for *query* and return the top-N ranked results
+    plus two raw relevance signals captured before normalization.
 
-    Each result dict contains:
-        chunk   : The Chunk object
-        score   : Combined hybrid score (0–1)
+    Returns
+    -------
+    results            : list of dicts, each with 'chunk' and 'score' keys
+    max_raw_faiss_score: highest raw cosine similarity (IndexFlatIP, 0–1).
+                         Absolute semantic relevance — unaffected by what else
+                         was retrieved in this batch.
+    max_raw_bm25_score : highest raw BM25 score across all chunks.
+                         Meaningful keyword overlap; near-zero means the query
+                         terms do not appear in the indexed documents.
+
+    Use these two signals together as an OR gate for LLM calls: if either
+    exceeds its configured threshold the query is on-topic enough to call the
+    LLM.  This handles phrased questions like "can you tell me merits of X"
+    (lower FAISS due to framing words, but BM25 picks up the domain keyword).
     """
     top_n = top_n or RERANK_TOP_N
 
@@ -58,6 +70,12 @@ def retrieve(query: str, top_n: int | None = None) -> list[dict]:
     # 2. Retrieve candidates from both engines.
     vec_results = vector_service.search(query_vec, top_k=RETRIEVAL_TOP_K)
     bm25_results = bm25_service.search(query, top_k=RETRIEVAL_TOP_K)
+
+    # Capture absolute relevance BEFORE normalization destroys the scale.
+    # For IndexFlatIP on L2-normalised embeddings, these ARE cosine similarities.
+    max_raw_faiss_score: float = max((s for _, s in vec_results), default=0.0)
+    # BM25 raw scores: near-zero = high-frequency noise word; > 1.0 = domain keyword hit.
+    max_raw_bm25_score: float = max((s for _, s in bm25_results), default=0.0)
 
     # 3. Normalize scores to [0, 1].
     vec_scores = _normalize_scores(vec_results)
@@ -94,12 +112,15 @@ def retrieve(query: str, top_n: int | None = None) -> list[dict]:
             logger.info("Injected %d image chunk(s) for visual query.", len(injected))
 
     logger.info(
-        "Hybrid retrieval for '%.60s…': %d candidates → %d results.",
+        "Hybrid retrieval for '%.60s…': %d candidates → %d results "
+        "(faiss=%.3f, bm25=%.2f).",
         query,
         len(all_ids),
         len(results),
+        max_raw_faiss_score,
+        max_raw_bm25_score,
     )
-    return results
+    return results, max_raw_faiss_score, max_raw_bm25_score
 
 
 # ---------------------------------------------------------------------------

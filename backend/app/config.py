@@ -53,3 +53,14 @@ HYBRID_VECTOR_WEIGHT: float = 0.6   # Weight for FAISS vector score
 HYBRID_BM25_WEIGHT: float = 0.4     # Weight for BM25 keyword score
 RETRIEVAL_TOP_K: int = 20           # Candidates from each retriever
 RERANK_TOP_N: int = 5               # Final chunks returned after re-ranking
+
+# Minimum raw FAISS cosine similarity (0–1) between the query embedding and the
+# best-matching chunk.  Only one of the two relevance signals needs to pass.
+RETRIEVAL_RELEVANCE_THRESHOLD: float = 0.30
+
+# Minimum raw BM25 score for the best-matching chunk.  BM25 > 1.0 means a
+# meaningful domain keyword from the query appears in the documents (e.g.
+# "concurrency" in a Lambda doc).  Values near 0 are noise from high-frequency
+# words like "aws" that appear everywhere with near-zero IDF weight.
+# Only one of the two signals needs to pass for the LLM to be called.
+RETRIEVAL_BM25_RELEVANCE_THRESHOLD: float = 1.0

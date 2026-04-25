@@ -8,6 +8,7 @@ The index is rebuilt whenever new chunks are added.
 from __future__ import annotations
 
 import logging
+import re
 
 from rank_bm25 import BM25Okapi
 
@@ -21,8 +22,8 @@ _corpus_tokens: list[list[str]] = []
 
 
 def _tokenize(text: str) -> list[str]:
-    """Simple whitespace + lowercase tokenizer."""
-    return text.lower().split()
+    """Lowercase tokenizer that strips punctuation so 'concurrency?' matches 'concurrency'."""
+    return re.findall(r'\b\w+\b', text.lower())
 
 
 def build_index(chunks: list[Chunk]) -> int:

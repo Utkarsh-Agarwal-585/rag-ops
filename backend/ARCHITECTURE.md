@@ -228,6 +228,19 @@ sequenceDiagram
         end
     end
 
+    R->>LLM: classify_intent(query)
+    Note over LLM: chitchat / capability / rag
+    alt Intent = chitchat or capability
+        LLM-->>R: intent
+        R->>LLM: build_chitchat_prompt(query, history)
+        R->>LLM: call_llm(prompt, _CHITCHAT_SYSTEM_PROMPT)
+        LLM->>API: REST call (BYOK)
+        API-->>LLM: response text
+        LLM-->>R: answer
+        R->>R: Cache response
+        R-->>C: {answer, sources: []}
+    end
+
     R->>LLM: enrich_query(query, history)
     Note over LLM: Rewrites short follow-ups using last topic
     LLM-->>R: enriched_query
@@ -257,7 +270,14 @@ sequenceDiagram
     end
 
     RS->>MS: get_chunk_by_id() for each result
-    RS-->>R: ranked [{chunk, score}, ...]
+    RS-->>R: (ranked [{chunk, score}], max_raw_faiss, max_raw_bm25)
+
+    opt /query only — relevance gate
+        Note over R: max_raw_faiss >= 0.30 OR max_raw_bm25 >= 1.0?
+        alt Both below threshold (off-topic)
+            R-->>C: static "not in your documents" reply
+        end
+    end
 
     alt /api/v1/search (no LLM)
         R-->>C: {query, results: [{content, source, type, score, image_path?}]}
@@ -408,14 +428,23 @@ The cache key is `query + history_digest + provider` where `history_digest` is a
 
 ```mermaid
 flowchart TD
-    Q["User query + history"] --> ENR["enrich_query()\nheuristic rewrite"]
-    ENR --> CACHE{"Check cache\nkey = query + history_digest + provider"}
+    Q["User query + history"] --> CACHE{"Check cache\nkey = query + history_digest + provider"}
 
     CACHE -->|"Hit (within 15-min TTL)"| CACHED["Return cached response"]
-    CACHE -->|"Miss / Expired"| EMB["generate_embedding\nall-MiniLM-L6-v2"]
+    CACHE -->|"Miss / Expired"| INTENT["classify_intent(query)\nregex-based, no LLM call"]
+
+    INTENT -->|"chitchat / capability"| CHITCHAT["build_chitchat_prompt\n+ call_llm with _CHITCHAT_SYSTEM_PROMPT\nskips retrieval entirely"]
+    CHITCHAT --> STORE
+
+    INTENT -->|"rag"| ENR["enrich_query()\nheuristic rewrite for short follow-ups"]
+
+    ENR --> EMB["generate_embedding\nall-MiniLM-L6-v2"]
+    ENR --> BM25["BM25 search\ntop 20 by term frequency"]
 
     EMB --> FAISS["FAISS search\ntop 20 by cosine sim"]
-    ENR --> BM25["BM25 search\ntop 20 by term frequency"]
+
+    FAISS -->|"capture raw score BEFORE normalize"| RAW["max_raw_faiss\nmax_raw_bm25"]
+    BM25 -->|"capture raw score BEFORE normalize"| RAW
 
     FAISS --> NORM1["Normalize scores\nmin-max -> 0-1"]
     BM25 --> NORM2["Normalize scores\nmin-max -> 0-1"]
@@ -431,7 +460,11 @@ flowchart TD
     IMG -->|No| RESOLVE
     INJECT --> RESOLVE["Resolve chunk objects\nfrom memory_store"]
 
-    RESOLVE --> OUT{Endpoint?}
+    RESOLVE --> GATE{"Relevance gate (OR)\nmax_raw_faiss >= 0.30\nOR max_raw_bm25 >= 1.0"}
+    RAW --> GATE
+    GATE -->|"Both fail"| OFFTOPIC["Static 'not in your documents' reply\nno LLM call"]
+    GATE -->|"Either passes"| OUT{Endpoint?}
+
     OUT -->|"/search"| SOUT["Return ranked chunks\nwith scores + metadata"]
     OUT -->|"/query"| PROMPT["build_prompt\ncontext + history + question"]
     PROMPT --> LLM["call_llm\nGemini or OpenAI"]
@@ -502,9 +535,9 @@ Single entry point for the entire pipeline. Runs 5 steps:
 | `embedding_service.py` | Lazy-loaded `all-MiniLM-L6-v2`; single + batch embedding |
 | `deduplication_service.py` | Union-find clustering at cosine sim ≥ 0.85; preserves image_paths |
 | `vector_service.py` | FAISS `IndexFlatIP` (inner product on L2-normalised = cosine sim) |
-| `bm25_service.py` | `BM25Okapi`; rebuilt from full store on every upload |
-| `retrieval_service.py` | Hybrid scoring + image injection (3-strategy) |
-| `llm_service.py` | Query enrichment + prompt builder + BYOK LLM calls |
+| `bm25_service.py` | `BM25Okapi`; regex tokenizer (`re.findall(r'\b\w+\b')`) strips punctuation; rebuilt on every upload |
+| `retrieval_service.py` | Hybrid scoring + image injection (3-strategy); returns `(results, max_raw_faiss, max_raw_bm25)` |
+| `llm_service.py` | Intent classification + query enrichment + chitchat path + prompt builder + BYOK LLM calls |
 | `cache_service.py` | In-memory TTL cache; key includes history digest |
 
 ### 8.6 Storage Layer
@@ -623,6 +656,8 @@ All constants live in `app/config.py`.
 | `HYBRID_BM25_WEIGHT` | 0.4 | BM25 score weight |
 | `RETRIEVAL_TOP_K` | 20 | Candidates from each retriever |
 | `RERANK_TOP_N` | 5 | Final chunks after re-ranking |
+| `RETRIEVAL_RELEVANCE_THRESHOLD` | 0.30 | Min raw FAISS cosine sim — passes relevance gate |
+| `RETRIEVAL_BM25_RELEVANCE_THRESHOLD` | 1.0 | Min raw BM25 score — passes relevance gate (OR with FAISS) |
 
 ### Cache
 
@@ -697,3 +732,10 @@ Event Loop (async)
 | History digest in cache key | Same question in different conversation contexts gets separate cache entries |
 | `include_sources` flag on query | Sources are optional — reduces response payload when not needed |
 | Provider passed to upload and query | Same API key used for both image captioning and LLM answering |
+| Intent classification before retrieval | Greetings and capability questions bypass retrieval entirely — no wasted embedding + search + LLM call |
+| Relevance gate uses raw (pre-normalization) scores | Min-max normalization makes top score always 1.0; only raw scores carry absolute relevance signal |
+| OR logic on FAISS + BM25 thresholds | FAISS score diluted by question framing words; BM25 catches domain keywords that FAISS misses ("concurrency?") |
+| BM25 regex tokenizer | `re.findall(r'\b\w+\b')` strips punctuation so "concurrency?" matches "concurrency" in corpus |
+| Rule 6 in `_SYSTEM_PROMPT` | Context related but not specific → 1–2 sentences + one short hint; prevents full tutorials on adjacent topics |
+| Rule 7 in `_SYSTEM_PROMPT` | Multi-topic queries → LLM must explicitly call out uncovered topics before answering covered ones |
+| Chitchat path uses `_CHITCHAT_SYSTEM_PROMPT` | Separate system prompt tells LLM user has already uploaded documents — avoids "please upload files" in responses |

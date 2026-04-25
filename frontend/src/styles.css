@@ -284,6 +284,16 @@ body {
   75%  { content: "..."; }
 }
 
+/* ── Context-lost warning banner ─────────────────────────────── */
+.context-lost-banner {
+  background: #fff8e1;
+  border-bottom: 1px solid #ffe082;
+  color: #7a5800;
+  font-size: 0.875rem;
+  padding: 10px 24px;
+  text-align: center;
+}
+
 /* ── Upload loader overlay ────────────────────────────────────── */
 .loader-overlay {
   position: fixed;

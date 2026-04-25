@@ -15,8 +15,16 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from app.config import RETRIEVAL_BM25_RELEVANCE_THRESHOLD, RETRIEVAL_RELEVANCE_THRESHOLD
 from app.services.retrieval.cache_service import get_cache, set_cache
-from app.services.retrieval.llm_service import build_prompt, call_llm, enrich_query
+from app.services.retrieval.llm_service import (
+    _CHITCHAT_SYSTEM_PROMPT,
+    build_chitchat_prompt,
+    build_prompt,
+    call_llm,
+    classify_intent,
+    enrich_query,
+)
 from app.services.retrieval.retrieval_service import retrieve
 
 logger = logging.getLogger(__name__)
@@ -67,28 +75,83 @@ async def query_documents(req: QueryRequest) -> JSONResponse:
             body["sources"] = cached.get("sources", [])
         return JSONResponse(status_code=200, content=body)
 
-    # 1. Enrich the query with conversation context for better retrieval.
+    # 1. Classify intent — chitchat and capability questions bypass retrieval.
+    intent = classify_intent(req.query)
+    if intent in ("chitchat", "capability"):
+        chitchat_prompt = build_chitchat_prompt(req.query, history)
+        try:
+            answer = await asyncio.to_thread(
+                call_llm, chitchat_prompt, req.api_key, req.provider,
+                system_prompt=_CHITCHAT_SYSTEM_PROMPT,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+        set_cache(req.query + cache_key_suffix, req.provider, {"answer": answer, "sources": []})
+        return JSONResponse(status_code=200, content={"answer": answer, "sources": []})
+
+    # 2. Enrich the query with conversation context for better retrieval.
     #    e.g. "can you give an image?" → "image of single server setup"
     enriched_query = enrich_query(req.query, history)
     logger.info("Query enriched: '%s' → '%s'", req.query[:60], enriched_query[:60])
 
-    # 2. Retrieve relevant chunks using the enriched query.
+    # 3. Retrieve relevant chunks using the enriched query.
     try:
-        results = await asyncio.to_thread(retrieve, enriched_query)
+        results, max_raw_faiss, max_raw_bm25 = await asyncio.to_thread(retrieve, enriched_query)
     except Exception as exc:
         logger.error("Retrieval failed: %s", exc)
         raise HTTPException(status_code=500, detail=f"Retrieval error: {exc}") from exc
 
+    # 3a. No documents uploaded yet — tell the user warmly, no LLM call.
     if not results:
         return JSONResponse(
             status_code=200,
             content={
-                "answer": "No relevant documents found. Please upload files first.",
+                "answer": (
+                    "It looks like you haven't uploaded any documents yet! "
+                    "Go ahead and upload a PDF, TXT, or LOG file using the panel on the left, "
+                    "and I'll be ready to answer questions based on its content."
+                ),
                 "sources": [],
             },
         )
 
-    # 3. Build prompt with history context and call LLM.
+    # 3b. Off-topic gate — OR logic across two independent relevance signals:
+    #
+    #   FAISS cosine ≥ 0.30  →  semantically close to the document domain
+    #   BM25 score  ≥ 1.0    →  a meaningful domain keyword appears in the docs
+    #                            (e.g. "concurrency" in a Lambda doc scores ~2–5;
+    #                             noise words like "aws" score ~0.05 due to low IDF)
+    #
+    # Passing either signal is enough.  This handles phrased questions like
+    # "can you tell me merits of provisioned concurrency?" whose FAISS score is
+    # diluted by framing words, but whose BM25 score fires on "concurrency".
+    # Both signals fail only for truly off-topic queries ("quick sort", "Fargate"
+    # not in the doc), where neither semantic nor keyword overlap exists.
+    is_on_topic = (
+        max_raw_faiss >= RETRIEVAL_RELEVANCE_THRESHOLD
+        or max_raw_bm25 >= RETRIEVAL_BM25_RELEVANCE_THRESHOLD
+    )
+    if not is_on_topic:
+        logger.info(
+            "Query '%.60s…' off-topic (faiss=%.3f, bm25=%.2f) — skipping LLM.",
+            req.query, max_raw_faiss, max_raw_bm25,
+        )
+        return JSONResponse(
+            status_code=200,
+            content={
+                "answer": (
+                    "That topic doesn't appear to be covered in your uploaded documents. "
+                    "Try asking something related to the content you've uploaded, "
+                    "or upload a document on this subject to get detailed answers."
+                ),
+                "sources": [],
+            },
+        )
+
+    # 4. Build prompt with history context and call LLM.
     prompt = build_prompt(req.query, results, history=history)
 
     try:
@@ -98,7 +161,7 @@ async def query_documents(req: QueryRequest) -> JSONResponse:
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    # 3. Build sources list (always computed, conditionally returned).
+    # 5. Build sources list (always computed, conditionally returned).
     sources = []
     for item in results:
         chunk = item["chunk"]
@@ -111,10 +174,10 @@ async def query_documents(req: QueryRequest) -> JSONResponse:
             source_entry["image_path"] = chunk.metadata.get("image_path")
         sources.append(source_entry)
 
-    # 4. Cache the full response.
+    # 6. Cache the full response.
     set_cache(req.query + cache_key_suffix, req.provider, {"answer": answer, "sources": sources})
 
-    # 5. Return answer; include sources only if the client asked for them.
+    # 7. Return answer; include sources only if the client asked for them.
     response_body: dict = {"answer": answer}
     if req.include_sources:
         response_body["sources"] = sources
@@ -140,7 +203,7 @@ async def search_chunks(req: SearchRequest) -> JSONResponse:
     an answer.
     """
     try:
-        results = await asyncio.to_thread(retrieve, req.query, req.top_n)
+        results, _, _ = await asyncio.to_thread(retrieve, req.query, req.top_n)
     except Exception as exc:
         logger.error("Search failed: %s", exc)
         raise HTTPException(status_code=500, detail=f"Search error: {exc}") from exc

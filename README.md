@@ -92,7 +92,7 @@ You will need an API key from **Google AI Studio** (Gemini) or **OpenAI** to use
 cd backend
 
 # Create the virtual environment
-python3 -m venv .venv
+python -m venv .venv
 
 # Activate it
 source .venv/bin/activate        # macOS / Linux
@@ -101,7 +101,14 @@ source .venv/bin/activate        # macOS / Linux
 
 # Install dependencies
 pip install -r requirements.txt
+```
 
+Optional — set a default Gemini key for image captioning (can also be provided per-request via the UI):
+
+```bash
+export GEMINI_API_KEY=your_key_here
+export GEMINI_MODEL=gemini-2.5-flash   # optional, this is the default
+```
 
 Start the server:
 
@@ -239,6 +246,8 @@ All backend constants are in [`backend/app/config.py`](backend/app/config.py).
 | HYBRID_VECTOR_WEIGHT | 0.6 | FAISS score weight in hybrid search |
 | HYBRID_BM25_WEIGHT | 0.4 | BM25 score weight in hybrid search |
 | DEDUP_SIMILARITY_THRESHOLD | 0.85 | Cosine sim above this merges chunks |
+| RETRIEVAL_RELEVANCE_THRESHOLD | 0.30 | Min raw FAISS cosine similarity to call LLM |
+| RETRIEVAL_BM25_RELEVANCE_THRESHOLD | 1.0 | Min raw BM25 score to call LLM (OR with FAISS) |
 
 ---
 
