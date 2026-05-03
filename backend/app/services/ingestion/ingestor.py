@@ -47,7 +47,7 @@ from app.services.parsing.image_extractor import extract_images_from_pdf, save_c
 from app.services.parsing.log_parser import is_log_content, parse_log_text
 from app.services.parsing.pdf_parser import parse_pdf
 from app.services.parsing.text_parser import parse_text
-from app.storage.memory_store import store_chunks
+from app.storage.memory_store import remove_chunks_by_source, source_exists, store_chunks
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +114,26 @@ async def ingest_file(file_path: str, original_filename: str, *, api_key: str = 
     if ext == ".pdf":
         image_chunks = await _run_image_pipeline(file_path, original_filename, api_key=api_key, provider=provider)
 
-    # ── Step 4: Merge, persist, return ───────────────────────────────────────
+    # ── Step 4: Evict existing chunks for this source, then persist ──────────
+    # Handles both duplicate uploads and re-uploads after server restart.
+    if source_exists(original_filename):
+        logger.info(
+            "'%s' already in store — evicting old chunks before re-ingestion.",
+            original_filename,
+        )
+        removed_ids = remove_chunks_by_source(original_filename)
+        if removed_ids:
+            # Clean up FAISS and BM25 indexes synchronously (fast operations).
+            from app.services.retrieval.vector_service import remove_ids
+            from app.services.retrieval.bm25_service import build_index
+            from app.storage.memory_store import get_all_chunks
+            remove_ids(set(removed_ids))
+            build_index(get_all_chunks())
+            logger.info(
+                "Evicted %d old chunk(s) for '%s' from store and indexes.",
+                len(removed_ids),
+                original_filename,
+            )
     all_chunks = text_chunks + image_chunks
     store_chunks(all_chunks)
 
@@ -166,6 +185,11 @@ async def _run_retrieval_indexing(chunks: list[Chunk]) -> list[Chunk]:
             len(chunks),
             len(deduped),
         )
+
+        # Persist the updated state to disk so it survives server restarts.
+        from app.services.retrieval.persistence_service import save_all
+        save_all()
+
         return deduped
 
     except Exception as exc:
@@ -219,7 +243,21 @@ async def _run_image_pipeline(
         captions_generated = 0
         captions_reused = 0
 
-        for img_data in extracted:
+        # Process in batches to stay under API rate limits.
+        # A short pause between batches prevents 429s on bulk uploads.
+        _CAPTION_BATCH_SIZE = 5
+        _CAPTION_BATCH_PAUSE = 1.0  # seconds between batches
+
+        for img_idx, img_data in enumerate(extracted):
+            # Pause between batches (not before the very first image).
+            if img_idx > 0 and img_idx % _CAPTION_BATCH_SIZE == 0:
+                logger.debug(
+                    "Caption batch %d complete — pausing %.1fs before next batch.",
+                    img_idx // _CAPTION_BATCH_SIZE,
+                    _CAPTION_BATCH_PAUSE,
+                )
+                await asyncio.sleep(_CAPTION_BATCH_PAUSE)
+
             effective_key = api_key or GEMINI_API_KEY
 
             if img_data["saved_caption"]:

@@ -33,7 +33,19 @@ _IMAGE_KEYWORDS = re.compile(
 
 
 def _normalize_scores(results: list[tuple[str, float]]) -> dict[str, float]:
-    """Min-max normalize scores to [0, 1]."""
+    """
+    Min-max normalize a list of (chunk_id, score) pairs to the [0, 1] range.
+
+    Why min-max and not z-score?
+        We want the best result to always score 1.0 so the weighted combination
+        (0.6 × FAISS + 0.4 × BM25) produces a meaningful hybrid score regardless
+        of the absolute scale of each retriever's raw scores.
+
+    Edge case: if all scores are identical (span == 0), every score maps to 1.0
+    rather than dividing by zero.
+
+    Returns a dict mapping chunk_id → normalised score.
+    """
     if not results:
         return {}
     scores = [s for _, s in results]
@@ -137,13 +149,34 @@ def _inject_relevant_images(
     query_vec: list[float],
 ) -> list[dict]:
     """
-    Find image chunks relevant to the current result set.
+    Find image chunks relevant to the current result set and return them for injection.
 
-    Strategy (in priority order):
-    1. Extract figure references (e.g. "Figure 1-1") from the top text chunks,
-       then find image chunks whose captions mention the same figure.
-    2. Find image chunks from the same source pages as the top text chunks.
-    3. Fall back to embedding similarity against all image chunks.
+    Called only when the query contains visual keywords (image, diagram, figure, etc.).
+    Uses a 3-tier strategy so the most precise match is always preferred:
+
+    Strategy 1 — Figure reference matching (most precise):
+        Scan the top text chunks for figure references like "Figure 1-1".
+        Find image chunks whose captions mention the same figure number.
+        This directly links "Figure 1-1 shows the single server setup" in text
+        to the image chunk captioned "Figure 1-1, illustrates...".
+
+    Strategy 2 — Same source/page matching (moderate precision):
+        If no figure references were found, return image chunks from the same
+        source document as the top text results.  Page 1 is skipped because
+        it is almost always a book/document cover rather than a diagram.
+
+    Strategy 3 — Embedding similarity fallback (least precise):
+        If neither strategy above found anything, compute cosine similarity
+        between the query vector and all image chunk embeddings and return
+        the top 2 by similarity.  Page 1 images are still excluded.
+
+    Parameters
+    ----------
+    results      : Current top-N retrieval results (may include text + image chunks).
+    existing_ids : Set of chunk IDs already in results — prevents duplicates.
+    query_vec    : L2-normalised query embedding for Strategy 3 fallback.
+
+    Returns a list of result dicts (same shape as retrieve() results) to append.
     """
     all_chunks = get_all_chunks()
     image_chunks = [c for c in all_chunks if c.type == "image"]

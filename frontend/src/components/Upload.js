@@ -1,12 +1,17 @@
-import React, { useState, useRef } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import UploadLoader from "./UploadLoader";
 
-export default function Upload({ apiBase, apiKey, onUploadSuccess }) {
+export default function Upload({ apiBase, apiKey, onUploadSuccess, resetKey }) {
   const [status, setStatus] = useState({ text: "", type: "" });
   const [uploading, setUploading] = useState(false);
   const [fileSelected, setFileSelected] = useState(false);
   const [currentFile, setCurrentFile] = useState("");
   const fileRef = useRef(null);
+
+  // Clear status whenever the parent signals a reset (e.g. all docs deleted).
+  useEffect(() => {
+    if (resetKey > 0) setStatus({ text: "", type: "" });
+  }, [resetKey]);
 
   const handleUpload = async () => {
     const file = fileRef.current?.files[0];
@@ -35,10 +40,7 @@ export default function Upload({ apiBase, apiKey, onUploadSuccess }) {
       }
 
       const data = await res.json();
-      setStatus({
-        text: `${data.source}: ${data.chunks_created} chunks created`,
-        type: "success",
-      });
+      setStatus({ text: "Upload successful.", type: "success" });
       fileRef.current.value = "";
       setFileSelected(false);
       onUploadSuccess();

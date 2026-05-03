@@ -1,6 +1,6 @@
 # RAG Ingestion & Retrieval Backend — Architecture & Technical Breakdown
 
-> v2.1.0 · Python 3.10+ · FastAPI · Ingestion + Hybrid Retrieval + LLM Query + Conversation History
+> v2.2.0 · Python 3.10+ · FastAPI · Ingestion + Hybrid Retrieval + LLM Query + Conversation History + Persistence + Observability
 
 ---
 
@@ -51,11 +51,18 @@ graph TB
             RS["retrieval_service.py\nhybrid scoring + image injection"]
             LLM["llm_service.py\nGemini / OpenAI\nconversation history\nquery enrichment"]
             QC["cache_service.py\nin-memory TTL cache\nhistory-aware key"]
+            PS["persistence_service.py\nsave/load on upload/startup"]
+        end
+
+        subgraph Observability["Observability"]
+            LOG["logging_config.py\nJSON structured logs\ncorrelation_id ContextVar"]
+            COR["middleware/correlation.py\nx-correlation-id\nper-request generation"]
         end
 
         subgraph Storage["Storage Layer"]
-            MS["memory_store.py\nlist + dict"]
+            MS["memory_store.py\nlist + dict + source_index"]
             DK["storage/images/<doc_stem>/\nPNG / JPEG + .caption.txt sidecars"]
+            IDX["storage/index/\nchunks.pkl + faiss.index\nbm25.pkl + faiss_ids.pkl"]
         end
     end
 
@@ -93,6 +100,13 @@ graph TB
     EMB --> DDP
     DDP --> VS
     DDP --> BM
+
+    ING -->|"save after upload"| PS
+    PS -->|"load on startup"| MS
+    PS -->|"load on startup"| VS
+    PS -->|"load on startup"| BM
+
+    COR -->|"inject correlation_id"| LOG
 
     R4 --> QC
     QC -->|"cache miss"| RS
@@ -481,6 +495,8 @@ flowchart TD
 | Endpoint | Method | Module | Purpose |
 |---|---|---|---|
 | `/api/v1/upload` | POST | `routes/upload.py` | Accept file + api_key + provider, run ingestion + indexing |
+| `/api/v1/documents` | GET | `routes/documents.py` | List all uploaded documents with chunk counts per type |
+| `/api/v1/documents/{filename}` | DELETE | `routes/documents.py` | Delete a document and all its data; returns per-step status + warnings array |
 | `/api/v1/chunks` | GET | `routes/chunks.py` | Paginated chunk listing with optional `?source=` filter |
 | `/api/v1/chunks/stats` | GET | `routes/chunks.py` | Aggregate counts by type + source list |
 | `/api/v1/chunks/index-stats` | GET | `routes/chunks.py` | FAISS and BM25 index state |
@@ -512,7 +528,35 @@ Single entry point for the entire pipeline. Runs 5 steps:
 | 4 | Store chunks in memory | Always succeeds |
 | 5 | Embed + dedup + index | Swallowed — chunks stored but not searchable |
 
-### 8.3 Parsing Layer
+### 8.3 Delete Algorithm (`DELETE /api/v1/documents/{filename}`)
+
+The delete is surgical — only data for the specified document is removed. Each step runs independently; failures are collected in a `warnings` array rather than raised, so partial success is possible.
+
+| Step | Operation | Notes |
+|---|---|---|
+| 1 | `remove_chunks_by_source(filename)` | Removes chunks from the in-memory store; returns the list of removed chunk IDs |
+| 2 | `remove_ids(set(removed_ids))` | Removes vectors from FAISS by rebuilding the index without the deleted IDs |
+| 3 | `build_index(get_all_chunks())` | Rebuilds BM25 over the remaining chunks |
+| 4 | `shutil.rmtree(storage/images/<stem>/)` | Deletes the image subdirectory and all caption sidecars; no-op for `.txt`/`.log` files |
+| 5 | `save_all()` | Persists the updated FAISS index, BM25 corpus, and chunk store to disk |
+
+**Response shape:**
+```json
+{
+  "deleted": "document.pdf",
+  "chunks_removed": 145,
+  "steps": {
+    "memory": "ok",
+    "faiss": "ok",
+    "bm25": "ok",
+    "images": "ok",
+    "persistence": "ok"
+  },
+  "warnings": []
+}
+```
+
+### 8.4 Parsing Layer
 
 | Module | Input | Output | Notes |
 |---|---|---|---|
@@ -521,14 +565,15 @@ Single entry point for the entire pipeline. Runs 5 steps:
 | `log_parser.py` | Raw text | `list[LogEntry]` | JSON + regex patterns |
 | `image_extractor.py` | `.pdf` path | Image metadata + bytes | xref-stable names, per-doc subdir, caption sidecars |
 
-### 8.4 Captioning Layer (`gemini_captioner.py`)
+### 8.5 Captioning Layer (`gemini_captioner.py`)
 
 - Supports **Gemini** (default) and **OpenAI** vision models
+- OpenAI captioning uses `gpt-4o-mini` (configured via `OPENAI_VISION_MODEL` in `config.py`)
 - Provider selected per-request via `provider` field
 - 2 retries with 1.5s delay; falls back to `FALLBACK_CAPTION` on total failure
 - API key passed per-request, never stored
 
-### 8.5 Retrieval Pipeline
+### 8.6 Retrieval Pipeline
 
 | Module | Purpose |
 |---|---|
@@ -540,7 +585,7 @@ Single entry point for the entire pipeline. Runs 5 steps:
 | `llm_service.py` | Intent classification + query enrichment + chitchat path + prompt builder + BYOK LLM calls |
 | `cache_service.py` | In-memory TTL cache; key includes history digest |
 
-### 8.6 Storage Layer
+### 8.7 Storage Layer
 
 | Structure | Type | Purpose |
 |---|---|---|
@@ -644,6 +689,8 @@ All constants live in `app/config.py`.
 | `IMAGES_URL_PREFIX` | `/storage/images` | Static files URL mount |
 | `GEMINI_API_KEY` | env var | Google AI key (optional) |
 | `GEMINI_MODEL` | `gemini-2.5-flash` | Captioning model |
+| `OPENAI_MODEL` | `gpt-4o-mini` | OpenAI chat completions model |
+| `OPENAI_VISION_MODEL` | `gpt-4o-mini` | OpenAI image captioning model |
 
 ### Retrieval
 
@@ -697,9 +744,9 @@ Event Loop (async)
 
 | Data | Storage | Survives restart? |
 |---|---|---|
-| Text/log chunks | In-memory (`memory_store`) | No — re-upload required |
-| FAISS vector index | In-memory | No — rebuilt on re-upload |
-| BM25 index | In-memory | No — rebuilt on re-upload |
+| Text/log chunks | In-memory + `storage/index/chunks.pkl` | Yes — loaded on startup |
+| FAISS vector index | In-memory + `storage/index/faiss.index` | Yes — loaded on startup |
+| BM25 index | In-memory + `storage/index/bm25.pkl` | Yes — loaded on startup |
 | Query response cache | In-memory | No — cleared on restart |
 | Embedding model weights | Lazy-loaded from disk | Yes (sentence-transformers cache) |
 | Extracted images | `storage/images/<stem>/` on disk | Yes |
@@ -739,3 +786,12 @@ Event Loop (async)
 | Rule 6 in `_SYSTEM_PROMPT` | Context related but not specific → 1–2 sentences + one short hint; prevents full tutorials on adjacent topics |
 | Rule 7 in `_SYSTEM_PROMPT` | Multi-topic queries → LLM must explicitly call out uncovered topics before answering covered ones |
 | Chitchat path uses `_CHITCHAT_SYSTEM_PROMPT` | Separate system prompt tells LLM user has already uploaded documents — avoids "please upload files" in responses |
+| Persistence after every upload | State is always current; restart recovery is automatic with no manual intervention |
+| Evict-before-ingest on re-upload | Prevents duplicate chunks accumulating across multiple uploads of the same file |
+| `_source_index` in memory store | O(1) lookup of all chunk IDs for a given source — makes eviction fast without scanning the full list |
+| `remove_ids()` rebuilds FAISS | `IndexFlatIP` doesn't support deletion; reconstruct_n + filter is the correct approach |
+| JSON structured logging | Machine-parseable logs; compatible with any log aggregation tool (Datadog, CloudWatch, ELK) |
+| `correlation_id_var` as ContextVar | Thread-safe per-request context in async code; no global state, no lock needed |
+| `x-correlation-id` in response headers | Client can copy the ID from DevTools Network tab to correlate errors with server logs |
+| Exponential backoff on captioning | 2s → 4s → 8s → 16s; prevents 429 storms on bulk image uploads; 4 attempts before fallback |
+| Batch pause every 5 images | Proactive rate limiting before hitting API limits; 1s pause between batches |

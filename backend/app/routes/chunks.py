@@ -98,3 +98,130 @@ async def cache_stats() -> dict:
     """Return statistics about the in-memory query response cache."""
     from app.services.retrieval.cache_service import get_cache_stats
     return get_cache_stats()
+
+
+@router.get(
+    "/documents",
+    summary="List all uploaded documents",
+    response_description="Unique documents with chunk counts",
+)
+async def list_documents() -> dict:
+    """
+    Return a deduplicated list of all documents currently in the store,
+    with per-document chunk counts broken down by type.
+
+    Each entry uses the base filename (without '#page=N' suffix) so image
+    chunks and text chunks from the same PDF are grouped together.
+    """
+    from app.storage.memory_store import get_all_chunks
+
+    all_chunks = get_all_chunks()
+
+    # Aggregate per base-source document.
+    docs: dict[str, dict] = {}
+    for chunk in all_chunks:
+        base = chunk.source.split("#")[0]
+        if base not in docs:
+            docs[base] = {"name": base, "doc": 0, "log": 0, "image": 0, "total": 0}
+        docs[base][chunk.type] += 1
+        docs[base]["total"] += 1
+
+    return {
+        "total_documents": len(docs),
+        "documents": sorted(docs.values(), key=lambda d: d["name"]),
+    }
+
+
+@router.delete(
+    "/documents/{filename}",
+    summary="Delete a document and all its associated data",
+    response_description="Deletion summary with per-step status",
+)
+async def delete_document(filename: str) -> dict:
+    """
+    Delete a document from the store, FAISS index, BM25 index, and disk.
+
+    Steps (each is attempted independently — a failure in one does not
+    prevent the remaining steps from running):
+      1. Remove chunks from memory store
+      2. Remove vectors from FAISS
+      3. Rebuild BM25 over remaining chunks
+      4. Delete image subdirectory from disk (images + caption sidecars)
+      5. Persist updated state to disk
+
+    Returns a structured response with per-step results and any warnings,
+    so the caller knows exactly what succeeded and what did not.
+    """
+    from app.storage.memory_store import (
+        get_all_chunks,
+        remove_chunks_by_source,
+        source_exists,
+    )
+    from app.services.retrieval.vector_service import remove_ids
+    from app.services.retrieval.bm25_service import build_index
+    from app.services.retrieval.persistence_service import save_all
+    from app.services.parsing.image_extractor import _safe_stem
+    from app.config import IMAGES_DIR
+    import shutil
+    import os
+
+    if not source_exists(filename):
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail=f"Document '{filename}' not found.")
+
+    warnings: list[str] = []
+
+    # ── Step 1: Remove chunks from memory store ──────────────────────────────
+    removed_ids = remove_chunks_by_source(filename)
+    chunks_removed = len(removed_ids)
+
+    # ── Step 2: Remove vectors from FAISS ───────────────────────────────────
+    faiss_removed = 0
+    try:
+        faiss_removed = remove_ids(set(removed_ids))
+    except Exception as exc:
+        warnings.append(f"FAISS cleanup partial: {exc}")
+
+    # ── Step 3: Rebuild BM25 over remaining chunks ───────────────────────────
+    try:
+        build_index(get_all_chunks())
+    except Exception as exc:
+        warnings.append(f"BM25 rebuild failed: {exc}")
+
+    # ── Step 4: Delete image subdirectory from disk ──────────────────────────
+    # Images live under storage/images/<stem>/ — same stem used during upload.
+    images_deleted = 0
+    stem = _safe_stem(filename)
+    doc_image_dir = os.path.join(IMAGES_DIR, stem)
+
+    if os.path.isdir(doc_image_dir):
+        try:
+            # Count files before deletion for the response summary.
+            images_deleted = sum(
+                1 for f in os.listdir(doc_image_dir)
+                if not f.endswith(".caption.txt")
+            )
+            shutil.rmtree(doc_image_dir)
+        except PermissionError as exc:
+            warnings.append(
+                f"Image directory could not be deleted (permission denied): {exc}"
+            )
+        except Exception as exc:
+            warnings.append(f"Image directory deletion failed: {exc}")
+
+    # ── Step 5: Persist updated state to disk ────────────────────────────────
+    persisted = False
+    try:
+        save_all()
+        persisted = True
+    except Exception as exc:
+        warnings.append(f"Persistence failed — restart will reload old state: {exc}")
+
+    return {
+        "deleted": filename,
+        "chunks_removed": chunks_removed,
+        "faiss_vectors_removed": faiss_removed,
+        "images_deleted": images_deleted,
+        "persisted": persisted,
+        "warnings": warnings,
+    }

@@ -64,3 +64,14 @@ RETRIEVAL_RELEVANCE_THRESHOLD: float = 0.30
 # words like "aws" that appear everywhere with near-zero IDF weight.
 # Only one of the two signals needs to pass for the LLM to be called.
 RETRIEVAL_BM25_RELEVANCE_THRESHOLD: float = 1.0
+
+# ── LLM query service ────────────────────────────────────────────────────────
+# OpenAI model used for both chat completions and image captioning.
+OPENAI_MODEL: str = "gpt-4o-mini"
+
+# Temperature for LLM responses.  Lower = more deterministic / factual.
+# 0.2 is a good default for RAG — factual answers with minimal hallucination.
+OPENAI_TEMPERATURE: float = 0.2
+
+# OpenAI vision model used for image captioning (same as chat model for gpt-4o-mini).
+OPENAI_VISION_MODEL: str = "gpt-4o-mini"

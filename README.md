@@ -36,7 +36,7 @@ rag-project/
 │       │   │   ├── doc_chunker.py       <- Sliding-window word chunker
 │       │   │   └── log_chunker.py       <- Time-window log summariser
 │       │   ├── captioning/
-│       │   │   └── gemini_captioner.py  <- Gemini / OpenAI vision captioning
+│       │   │   └── gemini_captioner.py  <- Gemini / OpenAI vision captioning (exp. backoff)
 │       │   └── retrieval/
 │       │       ├── embedding_service.py     <- sentence-transformers embeddings
 │       │       ├── deduplication_service.py <- Cosine-sim dedup (union-find)
@@ -44,7 +44,11 @@ rag-project/
 │       │       ├── bm25_service.py          <- BM25 keyword index
 │       │       ├── retrieval_service.py     <- Hybrid scoring + image injection
 │       │       ├── llm_service.py           <- Prompt builder + BYOK LLM calls
-│       │       └── cache_service.py         <- In-memory TTL query cache
+│       │       ├── cache_service.py         <- In-memory TTL query cache
+│       │       └── persistence_service.py   <- Save/load FAISS + BM25 + chunks to disk
+│       ├── middleware/
+│       │   └── correlation.py       <- x-correlation-id generation + propagation
+│       ├── logging_config.py        <- JSON structured logging + correlation ID context
 │       ├── storage/
 │       │   └── memory_store.py      <- In-memory chunk store (swappable facade)
 │       └── utils/
@@ -60,6 +64,7 @@ rag-project/
 │           ├── Upload.js       <- File upload with full-screen loader
 │           ├── UploadLoader.js <- Modal overlay loader (portal)
 │           ├── Chat.js         <- Chat panel + input bar
+│           ├── DocList.js      <- Collapsible sidebar list of uploaded docs with delete buttons
 │           └── Message.js      <- Message bubble + source cards + image rendering
 └── backend/storage/
     └── images/                 <- Extracted PDF images (per-doc subdirectories)
@@ -222,6 +227,8 @@ Retrieve chunks without calling an LLM (no API key needed).
 
 | Endpoint | Purpose |
 |---|---|
+| GET /api/v1/documents | List all uploaded documents with chunk counts per type |
+| DELETE /api/v1/documents/{filename} | Delete a document and all its data (chunks, vectors, BM25, images) |
 | GET /api/v1/chunks | Paginated chunk listing (?source=, ?limit=, ?offset=) |
 | GET /api/v1/chunks/stats | Aggregate counts by type + source list |
 | GET /api/v1/chunks/index-stats | FAISS + BM25 index state |
@@ -291,6 +298,9 @@ All backend constants are in [`backend/app/config.py`](backend/app/config.py).
 
 ## Notes
 
-- **Persistence:** All chunks and indexes are in-memory and reset on server restart. Re-upload files after restarting. Extracted images and caption sidecars on disk survive restarts.
+- **Persistence:** Chunks, FAISS index, and BM25 corpus are saved to `backend/storage/index/` after every upload and restored on server startup — no re-upload needed after restarts. Extracted images and caption sidecars also persist on disk.
+- **Duplicate uploads:** Re-uploading the same file evicts the old chunks from the store and indexes before ingesting fresh — no duplicates accumulate.
+- **Structured logging:** All log output is JSON-formatted with a `correlation_id` field. Every response includes an `x-correlation-id` header for traceability.
 - **API keys:** Keys are passed per-request and never stored or logged. Use HTTPS in production.
-- **Image captioning:** Requires a valid Gemini or OpenAI key. Without a key, images are still extracted and stored but get a fallback caption.
+- **OpenAI model:** Both chat completions and image captioning use `gpt-4o-mini` when OpenAI is selected as the provider. Configured via `OPENAI_MODEL` and `OPENAI_VISION_MODEL` in `config.py` (both default to `gpt-4o-mini`). A standard `sk-...` key works — no model-specific key needed.
+- **Image captioning:** Requires a valid Gemini or OpenAI key. Without a key, images are still extracted and stored but get a fallback caption. Captions are cached as `.caption.txt` sidecars so re-uploads skip API calls.

@@ -358,3 +358,109 @@ body {
   margin: 0;
   text-align: center;
 }
+
+/* ── Doc List ─────────────────────────────────────────────────── */
+.doc-list {
+  margin-top: 16px;
+  border: 1px solid #e0e0ef;
+  border-radius: 8px;
+  overflow: hidden;
+  background: #fff;
+}
+
+.doc-list-toggle {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 12px;
+  background: #f0f0fa;
+  border: none;
+  cursor: pointer;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: #3a3a5c;
+  text-align: left;
+}
+
+.doc-list-toggle:hover {
+  background: #e4e4f5;
+}
+
+.doc-list-toggle-icon {
+  font-size: 0.75rem;
+  color: #7070a0;
+}
+
+.doc-list-count {
+  margin-left: auto;
+  background: #6c63ff;
+  color: #fff;
+  font-size: 0.7rem;
+  font-weight: 700;
+  padding: 1px 7px;
+  border-radius: 10px;
+}
+
+.doc-list-items {
+  list-style: none;
+  padding: 4px 0;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.doc-list-empty {
+  padding: 10px 14px;
+  font-size: 0.8rem;
+  color: #9090b0;
+}
+
+.doc-list-item {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  padding: 7px 14px;
+  font-size: 0.8rem;
+  border-bottom: 1px solid #f0f0f8;
+  gap: 8px;
+}
+
+.doc-list-item:last-child {
+  border-bottom: none;
+}
+
+.doc-list-name {
+  color: #2e2e4e;
+  word-break: break-word;
+  flex: 1;
+}
+
+.doc-list-meta {
+  color: #9090b0;
+  font-size: 0.75rem;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.doc-list-delete {
+  flex-shrink: 0;
+  background: none;
+  border: none;
+  color: #c0c0d0;
+  font-size: 0.75rem;
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 4px;
+  line-height: 1;
+  transition: color 0.15s, background 0.15s;
+}
+
+.doc-list-delete:hover:not(:disabled) {
+  color: #e05555;
+  background: #fff0f0;
+}
+
+.doc-list-delete:disabled {
+  cursor: default;
+  opacity: 0.5;
+}

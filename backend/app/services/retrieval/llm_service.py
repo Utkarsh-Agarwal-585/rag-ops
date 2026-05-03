@@ -146,7 +146,13 @@ def classify_intent(query: str) -> Literal["chitchat", "capability", "rag"]:
 
 
 def build_chitchat_prompt(query: str, history: list[dict]) -> str:
-    """Assemble a prompt for chitchat/capability queries — no document context."""
+    """
+    Assemble a lightweight prompt for chitchat and capability queries.
+
+    No document context is included — the LLM responds purely from its
+    conversational persona.  The last 3 turns of history are included so
+    the assistant can reference what was just discussed.
+    """
     history_block = ""
     if history:
         turns = [
@@ -244,11 +250,13 @@ def call_llm(
 
 
 def _call_gemini(prompt: str, api_key: str, *, system_prompt: str | None = None) -> str:
-    """Call the Gemini generateContent REST endpoint.
+    """
+    Call the Gemini generateContent REST endpoint.
 
-    For Gemini the system instruction is already embedded in the prompt string
-    by build_prompt() / build_chitchat_prompt(), so system_prompt is accepted
-    for API consistency but not used separately here.
+    The system instruction is already embedded in the prompt string by
+    build_prompt() / build_chitchat_prompt(), so system_prompt is accepted
+    for API consistency with _call_openai() but is not used separately here.
+    The model name is read from GEMINI_MODEL in config.py.
     """
     from app.config import GEMINI_MODEL
     url = _GEMINI_URL.format(model=GEMINI_MODEL)
@@ -277,14 +285,22 @@ def _call_gemini(prompt: str, api_key: str, *, system_prompt: str | None = None)
 
 
 def _call_openai(prompt: str, api_key: str, *, system_prompt: str | None = None) -> str:
-    """Call the OpenAI chat completions endpoint."""
+    """
+    Call the OpenAI chat completions endpoint.
+
+    The system_prompt parameter allows the chitchat path to swap in a
+    conversational persona instead of the default RAG system prompt.
+    Model and temperature are read from config.py so they can be changed
+    without touching this file.
+    """
+    from app.config import OPENAI_MODEL, OPENAI_TEMPERATURE
     payload = {
-        "model": "gpt-4o-mini",
+        "model": OPENAI_MODEL,
         "messages": [
             {"role": "system", "content": system_prompt or _SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ],
-        "temperature": 0.2,
+        "temperature": OPENAI_TEMPERATURE,
     }
     headers = {
         "Authorization": f"Bearer {api_key}",

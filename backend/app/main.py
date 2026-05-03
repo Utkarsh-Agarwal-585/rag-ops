@@ -18,13 +18,31 @@ from __future__ import annotations
 
 import os
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from app.config import IMAGES_DIR, IMAGES_URL_PREFIX
+from app.logging_config import configure_logging
+from app.middleware.correlation import CorrelationIdMiddleware
 from app.routes import chunks, upload
 from app.routes import query as query_route
+
+# Configure JSON structured logging before anything else so all startup
+# messages (including persistence load) are captured in structured format.
+configure_logging()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Load persisted retrieval state on startup."""
+    from app.services.retrieval.persistence_service import load_all
+    load_all()
+    yield
+    # Shutdown: nothing extra needed — state is saved after every upload.
+
 
 # Ensure the images directory exists before mounting it as static files.
 # StaticFiles raises a RuntimeError at startup if the directory is absent.
@@ -39,11 +57,16 @@ app = FastAPI(
     version="1.1.0",
     docs_url="/docs",
     redoc_url="/redoc",
+    lifespan=lifespan,
 )
 
 # ---------------------------------------------------------------------------
 # Middleware
 # ---------------------------------------------------------------------------
+
+# CorrelationIdMiddleware must be added FIRST so the correlation ID is set
+# before any other middleware or route handler runs.
+app.add_middleware(CorrelationIdMiddleware)
 
 app.add_middleware(
     CORSMiddleware,

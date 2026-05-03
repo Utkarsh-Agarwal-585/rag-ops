@@ -53,6 +53,7 @@ graph TB
         subgraph Storage["Storage Layer"]
             MEM["In-Memory Store\nChunks + Embeddings"]
             DISK["Disk\nstorage/images/<doc>/\n*.caption.txt sidecars"]
+            IDX["Disk\nstorage/index/\nFAISS + BM25 + chunks.pkl"]
         end
     end
 
@@ -72,6 +73,7 @@ graph TB
     CAP -->|"BYOK"| OAPI
     ING --> MEM
     ING --> DISK
+    ING --> IDX
 
     QR --> CACHE
     CACHE -->|miss| HYBRID
@@ -174,9 +176,10 @@ sequenceDiagram
 
 | Component | Technology | Responsibility |
 |---|---|---|
-| **React UI** | React 18, plain CSS | Upload, chat, source rendering, image display |
+| **React UI** | React 18, plain CSS | Upload, chat, document list with delete, source rendering, image display |
 | **FastAPI** | Python 3.10+, Uvicorn | HTTP routing, request validation, async orchestration |
 | **Ingestor** | Python | Single pipeline entry point — coordinates all stages |
+| **Delete Handler** | Python | Surgical per-document delete — removes chunks, FAISS vectors, BM25 index, image subdirectory, and persists updated state; failures collected as warnings |
 | **PDF Parser** | pdfplumber | Text extraction from PDFs |
 | **Image Extractor** | PyMuPDF (fitz) | Image extraction, xref-stable naming, per-doc subdirs |
 | **Captioner** | google-genai / requests | Multimodal image captioning; sidecar persistence |
@@ -191,6 +194,10 @@ sequenceDiagram
 | **Cache Service** | Python stdlib | In-memory TTL cache keyed by query + history + provider |
 | **Memory Store** | Python stdlib | In-process chunk store (list + dict) |
 | **Disk Storage** | OS filesystem | Images + caption sidecars — survive server restarts |
+| **Persistence Service** | faiss + pickle | Save/load FAISS index + BM25 corpus + chunks to disk on every upload |
+| **DocList component** | React 18 | Collapsible sidebar list of all uploaded documents with per-doc delete buttons |
+| **Correlation Middleware** | Starlette | Generate `x-correlation-id` per request; inject into all log records |
+| **JSON Logger** | Python stdlib | Structured JSON log output with timestamp, level, logger, correlation ID |
 
 ---
 
@@ -206,6 +213,9 @@ sequenceDiagram
 | **Conversation-aware retrieval** | Query enrichment rewrites follow-ups into standalone queries before retrieval |
 | **History-aware caching** | Cache key includes a digest of recent history to prevent stale hits |
 | **No server-side session state** | History is sent by the client on every request |
+| **Restart-safe persistence** | FAISS + BM25 + chunks saved to disk after every upload; loaded on startup |
+| **Idempotent re-upload** | Re-uploading the same file evicts old chunks before ingesting fresh — no duplicates |
+| **Structured observability** | JSON logs + `x-correlation-id` on every request for end-to-end traceability |
 
 ---
 
@@ -213,7 +223,7 @@ sequenceDiagram
 
 | Area | Current state | Future improvement |
 |---|---|---|
-| **Persistence** | All chunks/indexes lost on restart | Persist FAISS index + chunks to SQLite / pgvector |
+| **Persistence** | FAISS + BM25 + chunks saved to disk; loaded on startup | ✅ Implemented — `persistence_service.py` |
 | **Vector DB** | In-memory FAISS | Swap `memory_store.py` + `vector_service.py` for Chroma / Pinecone |
 | **Auth** | None | Add API key auth or OAuth |
 | **Multi-tenancy** | Single shared store | Namespace chunks by user/session |
